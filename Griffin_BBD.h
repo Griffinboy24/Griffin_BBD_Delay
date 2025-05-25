@@ -20,6 +20,10 @@ namespace project
 #define M_PI 3.14159265358979323846
 #endif
 
+#ifndef M_LN10
+#define M_LN10 2.30258509299404568402
+#endif
+
     using namespace juce;
     using namespace hise;
     using namespace scriptnode;
@@ -47,7 +51,7 @@ namespace project
         public:
             static constexpr float kMinDelayMs = 40.0f;
             static constexpr float kMaxDelayMs = 3000.0f;
-            static constexpr float kMaxDarknessOffsetHz = 500.0f;  // max reduction in cutoff
+            static constexpr float kMaxDarknessOffsetHz = 350.0f;  // max reduction in cutoff
 
             AudioEffect(float initTotalMs = 333.0f,
                 float initFeedback = 0.35f,
@@ -79,8 +83,13 @@ namespace project
             inline void process(float* buf, int n)
             {
                 jassert(n <= kMaxBlock);
+
+                // ensure filters and delays updated once per block
+                updateParams();
+
                 auto* wet = wetBuffer.get();
                 FloatVectorOperations::copy(wet, buf, n);
+
                 const float fb = feedback;
                 float last = lastWetSample;
 
@@ -100,12 +109,10 @@ namespace project
 
                 lastWetSample = last;
 
-                float dGain = dryGain * volumeCompGain;
-                float wGain = wetGain * volumeCompGain;
+                const float dGain = dryGain * volumeCompGain;
+                const float wGain = wetGain * volumeCompGain;
                 FloatVectorOperations::multiply(buf, dGain, n);
                 FloatVectorOperations::addWithMultiply(buf, wet, wGain, n);
-
-                updateParams();
             }
 
             void setTotalDelayMs(float v) { totalDelayMs = v;               updateParams(); }
@@ -116,20 +123,23 @@ namespace project
             void setTrim(float d, float f) { delayTrim = d; filterTrim = f; updateParams(); }
 
         private:
-            void updateParams()
+            inline void updateParams()
             {
-                float perChipMs = totalDelayMs * delayTrim * 0.25f;
-                float samples = fs * perChipMs * 0.001f;
+                // Delay per chip
+                const float perChipMs = totalDelayMs * delayTrim * 0.25f;
+                const float samples = fs * perChipMs * 0.001f;
                 for (auto& d : line) d.setDelay(samples);
 
-                float normDelay = jlimit(0.0f, 1.0f,
+                // Darkness offset based on total delay
+                const float normDelay = jlimit(0.0f, 1.0f,
                     (totalDelayMs - kMinDelayMs) /
                     (kMaxDelayMs - kMinDelayMs));
-                float darknessOffset = normDelay * kMaxDarknessOffsetHz;
+                const float darknessOffset = normDelay * kMaxDarknessOffsetHz;
 
-                float baseCutoff = brightness * (3000.0f - 200.0f) + 200.0f;
-                float adjCutoffHz = jlimit(200.0f, 3000.0f, baseCutoff - darknessOffset);
-                float cutoffFreq = adjCutoffHz * filterTrim;
+                // Brightness to cutoff mapping
+                const float baseCutoff = brightness * 2800.0f + 200.0f;
+                const float adjCutoffHz = jlimit(200.0f, 3000.0f, baseCutoff - darknessOffset);
+                const float cutoffFreq = adjCutoffHz * filterTrim;
 
                 for (auto& d : line) d.setFilterFreq(cutoffFreq);
                 volumeCompGain = computeVolumeCompGain(cutoffFreq);
@@ -137,14 +147,17 @@ namespace project
 
             static constexpr float comp_m = -4.3913563f;
             static constexpr float comp_c = 18.3949866f;
+            static constexpr float comp_m_ln = comp_m / M_LN10;
+            static constexpr float compScale = 0.05f * M_LN10;
 
             static inline float computeVolumeCompGain(float f) noexcept
             {
-                float dB = comp_m * log10f(f) + comp_c;
-                return powf(10.0f, dB * 0.05f);
+                // faster alternative to log10f + powf
+                return expf((comp_m_ln * logf(f) + comp_c) * compScale);
             }
 
             static constexpr int kMaxBlock = 4096;
+
             float fs = 48000.0f, totalDelayMs, feedback, wetGain, dryGain;
             float brightness;
             float delayTrim = 1.0f, filterTrim = 1.0f;
@@ -183,13 +196,13 @@ namespace project
             if (widthFactor < 1.0f)
             {
                 float* tmp = msScratch.get();
-                float  midScale = 0.5f;
-                float  sideScale = 0.5f * widthFactor;
+                const float mid = 0.5f;
+                const float sd = 0.5f * widthFactor;
 
                 FloatVectorOperations::subtract(tmp, l, r, n);
-                FloatVectorOperations::multiply(tmp, sideScale, n);
+                FloatVectorOperations::multiply(tmp, sd, n);
                 FloatVectorOperations::add(r, l, r, n);
-                FloatVectorOperations::multiply(r, midScale, n);
+                FloatVectorOperations::multiply(r, mid, n);
                 FloatVectorOperations::add(l, r, tmp, n);
                 FloatVectorOperations::subtract(r, r, tmp, n);
             }
@@ -198,11 +211,11 @@ namespace project
         template <int P>
         inline void setParameter(double v)
         {
-            if constexpr (P == 0) L.setTotalDelayMs(float(v)), R.setTotalDelayMs(float(v));
-            else if constexpr (P == 1) L.setFeedback(float(v)), R.setFeedback(float(v));
-            else if constexpr (P == 2) L.setWetGain(float(v)), R.setWetGain(float(v));
-            else if constexpr (P == 3) L.setDryGain(float(v)), R.setDryGain(float(v));
-            else if constexpr (P == 4) L.setBrightness(float(v)), R.setBrightness(float(v));
+            if constexpr (P == 0) { L.setTotalDelayMs(float(v));    R.setTotalDelayMs(float(v)); }
+            else if constexpr (P == 1) { L.setFeedback(float(v));    R.setFeedback(float(v)); }
+            else if constexpr (P == 2) { L.setWetGain(float(v));     R.setWetGain(float(v)); }
+            else if constexpr (P == 3) { L.setDryGain(float(v));     R.setDryGain(float(v)); }
+            else if constexpr (P == 4) { L.setBrightness(float(v));  R.setBrightness(float(v)); }
             else if constexpr (P == 5)
             {
                 toleranceScale = float(v);
@@ -213,12 +226,12 @@ namespace project
 
         void createParameters(ParameterDataList& data)
         {
-            parameter::data p0("Delay (ms)", { 40.0, 3000.0, 0.1 }); registerCallback<0>(p0); p0.setDefaultValue(300.0);  data.add(std::move(p0));
-            parameter::data p1("Feedback", { 0.0,   0.99, 0.001 }); registerCallback<1>(p1); p1.setDefaultValue(0.3);    data.add(std::move(p1));
-            parameter::data p2("Wet Gain", { 0.0,    4.0, 0.001 }); registerCallback<2>(p2); p2.setDefaultValue(1.0);    data.add(std::move(p2));
-            parameter::data p3("Dry Gain", { 0.0,    2.0, 0.001 }); registerCallback<3>(p3); p3.setDefaultValue(1.0);    data.add(std::move(p3));
-            parameter::data p4("Brightness", { 0.0,    1.0, 0.001 }); registerCallback<4>(p4); p4.setDefaultValue(0.3); data.add(std::move(p4));
-            parameter::data p5("Stereo Width", { -1.0,    1.0, 0.001 }); registerCallback<5>(p5); p5.setDefaultValue(0.0);    data.add(std::move(p5));
+            parameter::data p0("Delay (ms)", { 40.0,   3000.0, 0.1 }); registerCallback<0>(p0); p0.setDefaultValue(300.0); data.add(std::move(p0));
+            parameter::data p1("Feedback", { 0.0,    0.99,  0.001 }); registerCallback<1>(p1); p1.setDefaultValue(0.3);   data.add(std::move(p1));
+            parameter::data p2("Wet Gain", { 0.0,    4.0,   0.001 }); registerCallback<2>(p2); p2.setDefaultValue(1.0);   data.add(std::move(p2));
+            parameter::data p3("Dry Gain", { 0.0,    2.0,   0.001 }); registerCallback<3>(p3); p3.setDefaultValue(1.0);   data.add(std::move(p3));
+            parameter::data p4("Brightness", { 0.0,    1.0,   0.001 }); registerCallback<4>(p4); p4.setDefaultValue(0.3);   data.add(std::move(p4));
+            parameter::data p5("Stereo Width", { -1.0,   1.0,   0.001 }); registerCallback<5>(p5); p5.setDefaultValue(0.0);   data.add(std::move(p5));
         }
 
         SN_EMPTY_PROCESS_FRAME;
@@ -244,10 +257,10 @@ namespace project
                 tolScale = tolAtZero * frac;
             }
 
-            float ldTrim = 1.0f - tolScale * baseDelayTol;
-            float rdTrim = 1.0f + tolScale * baseDelayTol;
-            float lfTrim = 1.0f;
-            float rfTrim = 1.0f + tolScale * baseFiltTolR;
+            const float ldTrim = 1.0f - tolScale * baseDelayTol;
+            const float rdTrim = 1.0f + tolScale * baseDelayTol;
+            const float lfTrim = 1.0f;
+            const float rfTrim = 1.0f + tolScale * baseFiltTolR;
 
             L.setTrim(ldTrim, lfTrim);
             R.setTrim(rdTrim, rfTrim);
