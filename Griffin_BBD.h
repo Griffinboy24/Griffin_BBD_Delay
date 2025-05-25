@@ -11,6 +11,7 @@
 #include "src/griffin_BBDFilterBank.h"
 #include "src/griffin_DelayInterpolation.h"
 #include "src/griffin_Compander.h"
+#include <cmath>
 
 namespace project
 {
@@ -41,49 +42,45 @@ namespace project
         static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
-        // Core BBD processing unit
         class AudioEffect
         {
         public:
+            static constexpr float kMinDelayMs = 40.0f;
+            static constexpr float kMaxDelayMs = 3000.0f;
+            static constexpr float kMaxDarknessOffsetHz = 500.0f;  // max reduction in cutoff
+
             AudioEffect(float initTotalMs = 333.0f,
                 float initFeedback = 0.35f,
                 float initWetGain = 1.0f,
                 float initDryGain = 1.0f,
-                int   initMode = 1) noexcept
+                float initBrightness = 0.285714f) noexcept
                 : totalDelayMs(initTotalMs),
                 feedback(initFeedback),
                 wetGain(initWetGain),
                 dryGain(initDryGain),
-                voicingMode(initMode)
+                brightness(initBrightness)
             {
                 wetBuffer.allocate(kMaxBlock, true);
             }
 
-            // Initialize DSP components
             void prepare(double newFs)
             {
                 fs = float(newFs);
                 dsp::ProcessSpec spec{ newFs, uint32(kMaxBlock), 1 };
-                for (auto& d : line)
-                    d.prepare(spec);
-
+                for (auto& d : line) d.prepare(spec);
                 comp.prepare(newFs, kMaxBlock);
                 exp.prepare(newFs, kMaxBlock);
-
                 constexpr float compFc = 40.0f;
                 comp.setCutoff(compFc);
                 exp.setCutoff(compFc);
-
                 updateParams();
             }
 
-            // Process one block of audio
             inline void process(float* buf, int n)
             {
                 jassert(n <= kMaxBlock);
                 auto* wet = wetBuffer.get();
                 FloatVectorOperations::copy(wet, buf, n);
-
                 const float fb = feedback;
                 float last = lastWetSample;
 
@@ -91,13 +88,11 @@ namespace project
                 {
                     float in = wet[i] + last * fb;
                     float x = comp.process(in);
-
                     for (auto& d : line)
                     {
                         d.pushSample(0, x);
                         x = d.popSample(0);
                     }
-
                     float out = exp.process(x);
                     last = out;
                     wet[i] = out;
@@ -105,47 +100,56 @@ namespace project
 
                 lastWetSample = last;
 
-                FloatVectorOperations::multiply(buf, dryGain, n);
-                FloatVectorOperations::addWithMultiply(buf, wet, wetGain, n);
+                float dGain = dryGain * volumeCompGain;
+                float wGain = wetGain * volumeCompGain;
+                FloatVectorOperations::multiply(buf, dGain, n);
+                FloatVectorOperations::addWithMultiply(buf, wet, wGain, n);
 
-                // once per block – keeps filter clocks aligned
                 updateParams();
             }
 
-            // Setters update internal parameters as needed
-            void setTotalDelayMs(float v) { totalDelayMs = v; updateParams(); }
+            void setTotalDelayMs(float v) { totalDelayMs = v;               updateParams(); }
             void setFeedback(float v) { feedback = jlimit(0.0f, 0.99f, v); }
             void setWetGain(float v) { wetGain = v; }
             void setDryGain(float v) { dryGain = v; }
-            void setVoicingMode(int v) { voicingMode = jlimit(1, 4, v); updateParams(); }
-            void setTrim(float dTrim, float fTrim) { delayTrim = dTrim; filterTrim = fTrim; updateParams(); }
+            void setBrightness(float v) { brightness = jlimit(0.0f, 1.0f, v); updateParams(); }
+            void setTrim(float d, float f) { delayTrim = d; filterTrim = f; updateParams(); }
 
         private:
             void updateParams()
             {
-                static constexpr float bright[4] = { 0.5f, 1.0f, 1.4f, 1.8f };
                 float perChipMs = totalDelayMs * delayTrim * 0.25f;
                 float samples = fs * perChipMs * 0.001f;
+                for (auto& d : line) d.setDelay(samples);
 
-                for (auto& d : line)
-                    d.setDelay(samples);
+                float normDelay = jlimit(0.0f, 1.0f,
+                    (totalDelayMs - kMinDelayMs) /
+                    (kMaxDelayMs - kMinDelayMs));
+                float darknessOffset = normDelay * kMaxDarknessOffsetHz;
 
-                constexpr float refSec = 0.020f;
-                float delaySec = samples / fs;
-                float cutoff = chowdsp::BBD::BBDFilterSpec::inputFilterOriginalCutoff
-                    * (refSec / delaySec)
-                    * bright[voicingMode - 1]
-                    * filterTrim;
+                float baseCutoff = brightness * (3000.0f - 200.0f) + 200.0f;
+                float adjCutoffHz = jlimit(200.0f, 3000.0f, baseCutoff - darknessOffset);
+                float cutoffFreq = adjCutoffHz * filterTrim;
 
-                for (auto& d : line)
-                    d.setFilterFreq(cutoff);
+                for (auto& d : line) d.setFilterFreq(cutoffFreq);
+                volumeCompGain = computeVolumeCompGain(cutoffFreq);
+            }
+
+            static constexpr float comp_m = -4.3913563f;
+            static constexpr float comp_c = 18.3949866f;
+
+            static inline float computeVolumeCompGain(float f) noexcept
+            {
+                float dB = comp_m * log10f(f) + comp_c;
+                return powf(10.0f, dB * 0.05f);
             }
 
             static constexpr int kMaxBlock = 4096;
             float fs = 48000.0f, totalDelayMs, feedback, wetGain, dryGain;
-            int voicingMode;
+            float brightness;
             float delayTrim = 1.0f, filterTrim = 1.0f;
             float lastWetSample = 0.0f;
+            float volumeCompGain = 1.0f;
 
             chowdsp::BBD::BBDDelayWrapper<4096, false> line[4];
             BBDCompressor comp;
@@ -153,7 +157,6 @@ namespace project
             juce::HeapBlock<float, 32> wetBuffer;
         };
 
-        // Prepare stereo processors
         void prepare(PrepareSpecs s)
         {
             msScratch.allocate(kMaxBlock, false);
@@ -177,38 +180,29 @@ namespace project
             L.process(l, n);
             R.process(r, n);
 
-            // Optional stereo width reduction
             if (widthFactor < 1.0f)
             {
                 float* tmp = msScratch.get();
-                float midScale = 0.5f;
-                float sideScale = 0.5f * widthFactor;
+                float  midScale = 0.5f;
+                float  sideScale = 0.5f * widthFactor;
 
                 FloatVectorOperations::subtract(tmp, l, r, n);
                 FloatVectorOperations::multiply(tmp, sideScale, n);
-
                 FloatVectorOperations::add(r, l, r, n);
                 FloatVectorOperations::multiply(r, midScale, n);
-
                 FloatVectorOperations::add(l, r, tmp, n);
                 FloatVectorOperations::subtract(r, r, tmp, n);
             }
         }
 
-        // Parameter callbacks
         template <int P>
         inline void setParameter(double v)
         {
-            if constexpr (P == 0) { L.setTotalDelayMs(float(v)); R.setTotalDelayMs(float(v)); }
-            else if constexpr (P == 1) { L.setFeedback(float(v));       R.setFeedback(float(v)); }
-            else if constexpr (P == 2) { L.setWetGain(float(v));        R.setWetGain(float(v)); }
-            else if constexpr (P == 3) { L.setDryGain(float(v));        R.setDryGain(float(v)); }
-            else if constexpr (P == 4)
-            {
-                int m = int(v + 0.5);
-                L.setVoicingMode(m);
-                R.setVoicingMode(m);
-            }
+            if constexpr (P == 0) L.setTotalDelayMs(float(v)), R.setTotalDelayMs(float(v));
+            else if constexpr (P == 1) L.setFeedback(float(v)), R.setFeedback(float(v));
+            else if constexpr (P == 2) L.setWetGain(float(v)), R.setWetGain(float(v));
+            else if constexpr (P == 3) L.setDryGain(float(v)), R.setDryGain(float(v));
+            else if constexpr (P == 4) L.setBrightness(float(v)), R.setBrightness(float(v));
             else if constexpr (P == 5)
             {
                 toleranceScale = float(v);
@@ -219,12 +213,12 @@ namespace project
 
         void createParameters(ParameterDataList& data)
         {
-            parameter::data p0("Delay (ms)", { 40.0, 2000.0, 0.1 }); registerCallback<0>(p0); p0.setDefaultValue(300.0); data.add(std::move(p0));
-            parameter::data p1("Feedback", { 0.0,  0.99,   0.001 }); registerCallback<1>(p1); p1.setDefaultValue(0.3);   data.add(std::move(p1));
-            parameter::data p2("Wet Gain", { 0.0,  4.0,    0.001 }); registerCallback<2>(p2); p2.setDefaultValue(1.0);   data.add(std::move(p2));
-            parameter::data p3("Dry Gain", { 0.0,  2.0,    0.001 }); registerCallback<3>(p3); p3.setDefaultValue(1.0);   data.add(std::move(p3));
-            parameter::data p4("Brightness", { 1.0,  4.0,    1.0 }); registerCallback<4>(p4); p4.setDefaultValue(1.0);   data.add(std::move(p4));
-            parameter::data p5("Analog Width", { -1.0, 2.0,    0.001 }); registerCallback<5>(p5); p5.setDefaultValue(1.0);   data.add(std::move(p5));
+            parameter::data p0("Delay (ms)", { 40.0, 3000.0, 0.1 }); registerCallback<0>(p0); p0.setDefaultValue(300.0);  data.add(std::move(p0));
+            parameter::data p1("Feedback", { 0.0,   0.99, 0.001 }); registerCallback<1>(p1); p1.setDefaultValue(0.3);    data.add(std::move(p1));
+            parameter::data p2("Wet Gain", { 0.0,    4.0, 0.001 }); registerCallback<2>(p2); p2.setDefaultValue(1.0);    data.add(std::move(p2));
+            parameter::data p3("Dry Gain", { 0.0,    2.0, 0.001 }); registerCallback<3>(p3); p3.setDefaultValue(1.0);    data.add(std::move(p3));
+            parameter::data p4("Brightness", { 0.0,    1.0, 0.001 }); registerCallback<4>(p4); p4.setDefaultValue(0.3); data.add(std::move(p4));
+            parameter::data p5("Stereo Width", { -1.0,    1.0, 0.001 }); registerCallback<5>(p5); p5.setDefaultValue(0.0);    data.add(std::move(p5));
         }
 
         SN_EMPTY_PROCESS_FRAME;
@@ -235,7 +229,6 @@ namespace project
         static constexpr int kMaxBlock = 4096;
         juce::HeapBlock<float, 32> msScratch;
 
-        // Apply analog mismatch tolerances based on control value
         void applyTolerances()
         {
             constexpr float baseDelayTol = 0.001f;
@@ -260,7 +253,6 @@ namespace project
             R.setTrim(rdTrim, rfTrim);
         }
 
-        // Compute stereo width factor for side attenuation
         void updateWidthFactor() noexcept
         {
             if (toleranceScale >= 0.0f)
@@ -273,8 +265,8 @@ namespace project
         }
 
         AudioEffect L, R;
-        float toleranceScale = 1.0f;  // control for analog mismatch
-        float widthFactor = 1.0f;  // stereo width (1.0 = full)
+        float toleranceScale = 1.0f;
+        float widthFactor = 1.0f;
     };
 
 } // namespace project
