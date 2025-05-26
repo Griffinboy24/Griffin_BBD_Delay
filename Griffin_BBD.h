@@ -11,6 +11,8 @@
 #include "src/griffin_BBDFilterBank.h"
 #include "src/griffin_DelayInterpolation.h"
 #include "src/griffin_Compander.h"
+
+
 #include <cmath>
 
 namespace project
@@ -51,7 +53,7 @@ namespace project
         public:
             static constexpr float kMinDelayMs = 40.0f;
             static constexpr float kMaxDelayMs = 3000.0f;
-            static constexpr float kMaxDarknessOffsetHz = 350.0f;  // max reduction in cutoff
+            static constexpr float kMaxDarknessOffsetHz = 300.0f;  // max reduction in cutoff
 
             AudioEffect(float initTotalMs = 333.0f,
                 float initFeedback = 0.35f,
