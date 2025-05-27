@@ -5,13 +5,12 @@
 #pragma once
 
 #include <JuceHeader.h>
-#include "src/XSimd_Helpers.h"
+#include "src/Utils_XSimd.h"
 #include "src/griffin_BBDDelayLine.h"
 #include "src/griffin_BBDDelayWrapper.h"
 #include "src/griffin_BBDFilterBank.h"
 #include "src/griffin_DelayInterpolation.h"
 #include "src/griffin_Compander.h"
-
 
 #include <cmath>
 
@@ -53,18 +52,22 @@ namespace project
         public:
             static constexpr float kMinDelayMs = 40.0f;
             static constexpr float kMaxDelayMs = 3000.0f;
-            static constexpr float kMaxDarknessOffsetHz = 300.0f;  // max reduction in cutoff
+            static constexpr float kMaxDarknessOffsetHz = 200.0f;
 
+            // Constructor now takes only wet-path parameters
             AudioEffect(float initTotalMs = 333.0f,
                 float initFeedback = 0.35f,
                 float initWetGain = 1.0f,
-                float initDryGain = 1.0f,
                 float initBrightness = 0.285714f) noexcept
                 : totalDelayMs(initTotalMs),
                 feedback(initFeedback),
                 wetGain(initWetGain),
-                dryGain(initDryGain),
-                brightness(initBrightness)
+                brightness(initBrightness),
+                // initialize glide state
+                targetDelayMs(initTotalMs),
+                currentDelayMs(initTotalMs),
+                glideTimeMs(0.0f),
+                glideCoef(1.0f)
             {
                 wetBuffer.allocate(kMaxBlock, true);
             }
@@ -73,12 +76,18 @@ namespace project
             {
                 fs = float(newFs);
                 dsp::ProcessSpec spec{ newFs, uint32(kMaxBlock), 1 };
-                for (auto& d : line) d.prepare(spec);
+                for (auto& d : line)    d.prepare(spec);
                 comp.prepare(newFs, kMaxBlock);
                 exp.prepare(newFs, kMaxBlock);
                 constexpr float compFc = 40.0f;
                 comp.setCutoff(compFc);
                 exp.setCutoff(compFc);
+
+                // init glide coefficients and states
+                updateGlideCoef();
+                currentDelayMs = totalDelayMs;
+                targetDelayMs = totalDelayMs;
+
                 updateParams();
             }
 
@@ -86,10 +95,11 @@ namespace project
             {
                 jassert(n <= kMaxBlock);
 
-                // ensure filters and delays updated once per block
+                // update per-block params (skips delay if gliding)
                 updateParams();
 
                 auto* wet = wetBuffer.get();
+                // seed the feedback loop with incoming signal
                 FloatVectorOperations::copy(wet, buf, n);
 
                 const float fb = feedback;
@@ -97,6 +107,15 @@ namespace project
 
                 for (int i = 0; i < n; ++i)
                 {
+                    // per-sample delay smoothing
+                    currentDelayMs += glideCoef * (targetDelayMs - currentDelayMs);
+
+                    // apply smoothed delay per chip
+                    const float perChipMs = currentDelayMs * delayTrim * 0.25f;
+                    const float samples = fs * perChipMs * 0.001f;
+                    for (auto& d : line)
+                        d.setDelay(samples);
+
                     float in = wet[i] + last * fb;
                     float x = comp.process(in);
                     for (auto& d : line)
@@ -111,34 +130,54 @@ namespace project
 
                 lastWetSample = last;
 
-                const float dGain = dryGain * volumeCompGain;
+                // only wet output
                 const float wGain = wetGain * volumeCompGain;
-                FloatVectorOperations::multiply(buf, dGain, n);
-                FloatVectorOperations::addWithMultiply(buf, wet, wGain, n);
+                FloatVectorOperations::multiply(wet, wGain, n);
+                FloatVectorOperations::copy(buf, wet, n);
             }
 
-            void setTotalDelayMs(float v) { totalDelayMs = v;               updateParams(); }
+            // snap target delay (does not override smoothed currentDelayMs)
+            void setTotalDelayMs(float v) { totalDelayMs = v; targetDelayMs = v; updateParams(); }
             void setFeedback(float v) { feedback = jlimit(0.0f, 0.99f, v); }
             void setWetGain(float v) { wetGain = v; }
-            void setDryGain(float v) { dryGain = v; }
             void setBrightness(float v) { brightness = jlimit(0.0f, 1.0f, v); updateParams(); }
             void setTrim(float d, float f) { delayTrim = d; filterTrim = f; updateParams(); }
 
+            // new: glide time in ms (0 = snap)
+            void setGlideMs(float v) noexcept { glideTimeMs = v; updateGlideCoef(); }
+
         private:
+            // recompute smoothing coefficient from glideTimeMs & fs
+            void updateGlideCoef() noexcept
+            {
+                if (glideTimeMs > 0.0f && fs > 0.0f)
+                {
+                    const float smoothSamples = (glideTimeMs * 0.001f) * fs;
+                    glideCoef = (smoothSamples > 0.0f) ? (1.0f / smoothSamples) : 1.0f;
+                }
+                else
+                {
+                    glideCoef = 1.0f;
+                }
+            }
+
             inline void updateParams()
             {
-                // Delay per chip
-                const float perChipMs = totalDelayMs * delayTrim * 0.25f;
-                const float samples = fs * perChipMs * 0.001f;
-                for (auto& d : line) d.setDelay(samples);
+                // per-chip delay only when snapping (glideCoef>=1)
+                if (glideCoef >= 1.0f)
+                {
+                    const float perChipMs = totalDelayMs * delayTrim * 0.25f;
+                    const float samples = fs * perChipMs * 0.001f;
+                    for (auto& d : line) d.setDelay(samples);
+                }
 
-                // Darkness offset based on total delay
+                // darkness offset
                 const float normDelay = jlimit(0.0f, 1.0f,
                     (totalDelayMs - kMinDelayMs) /
                     (kMaxDelayMs - kMinDelayMs));
                 const float darknessOffset = normDelay * kMaxDarknessOffsetHz;
 
-                // Brightness to cutoff mapping
+                // brightness cutoff
                 const float baseCutoff = brightness * 2800.0f + 200.0f;
                 const float adjCutoffHz = jlimit(200.0f, 3000.0f, baseCutoff - darknessOffset);
                 const float cutoffFreq = adjCutoffHz * filterTrim;
@@ -147,6 +186,7 @@ namespace project
                 volumeCompGain = computeVolumeCompGain(cutoffFreq);
             }
 
+            // compression  volume compensation
             static constexpr float comp_m = -4.3913563f;
             static constexpr float comp_c = 18.3949866f;
             static constexpr float comp_m_ln = comp_m / M_LN10;
@@ -154,14 +194,16 @@ namespace project
 
             static inline float computeVolumeCompGain(float f) noexcept
             {
-                // faster alternative to log10f + powf
                 return expf((comp_m_ln * logf(f) + comp_c) * compScale);
             }
 
             static constexpr int kMaxBlock = 4096;
 
-            float fs = 48000.0f, totalDelayMs, feedback, wetGain, dryGain;
-            float brightness;
+            float fs = 48000.0f;
+            float totalDelayMs, feedback, wetGain, brightness;
+            // glide state
+            float targetDelayMs, currentDelayMs;
+            float glideTimeMs, glideCoef;
             float delayTrim = 1.0f, filterTrim = 1.0f;
             float lastWetSample = 0.0f;
             float volumeCompGain = 1.0f;
@@ -213,27 +255,27 @@ namespace project
         template <int P>
         inline void setParameter(double v)
         {
-            if constexpr (P == 0) { L.setTotalDelayMs(float(v));    R.setTotalDelayMs(float(v)); }
-            else if constexpr (P == 1) { L.setFeedback(float(v));    R.setFeedback(float(v)); }
-            else if constexpr (P == 2) { L.setWetGain(float(v));     R.setWetGain(float(v)); }
-            else if constexpr (P == 3) { L.setDryGain(float(v));     R.setDryGain(float(v)); }
-            else if constexpr (P == 4) { L.setBrightness(float(v));  R.setBrightness(float(v)); }
-            else if constexpr (P == 5)
+            if constexpr (P == 0) { L.setTotalDelayMs(float(v));       R.setTotalDelayMs(float(v)); }
+            else if constexpr (P == 1) { L.setFeedback(float(v));      R.setFeedback(float(v)); }
+            else if constexpr (P == 2) { L.setWetGain(float(v));       R.setWetGain(float(v)); }
+            else if constexpr (P == 3) { L.setBrightness(float(v));    R.setBrightness(float(v)); }
+            else if constexpr (P == 4)
             {
                 toleranceScale = float(v);
                 applyTolerances();
                 updateWidthFactor();
             }
+            else if constexpr (P == 5) { L.setGlideMs(float(v));       R.setGlideMs(float(v)); }
         }
 
         void createParameters(ParameterDataList& data)
         {
-            parameter::data p0("Delay (ms)", { 40.0,   3000.0, 0.1 }); registerCallback<0>(p0); p0.setDefaultValue(300.0); data.add(std::move(p0));
-            parameter::data p1("Feedback", { 0.0,    0.99,  0.001 }); registerCallback<1>(p1); p1.setDefaultValue(0.3);   data.add(std::move(p1));
-            parameter::data p2("Wet Gain", { 0.0,    4.0,   0.001 }); registerCallback<2>(p2); p2.setDefaultValue(1.0);   data.add(std::move(p2));
-            parameter::data p3("Dry Gain", { 0.0,    2.0,   0.001 }); registerCallback<3>(p3); p3.setDefaultValue(1.0);   data.add(std::move(p3));
-            parameter::data p4("Brightness", { 0.0,    1.0,   0.001 }); registerCallback<4>(p4); p4.setDefaultValue(0.3);   data.add(std::move(p4));
-            parameter::data p5("Stereo Width", { -1.0,   1.0,   0.001 }); registerCallback<5>(p5); p5.setDefaultValue(0.0);   data.add(std::move(p5));
+            parameter::data p0("Delay (ms)", { 40.0,   3500.0, 0.001 }); registerCallback<0>(p0); p0.setDefaultValue(300.0); data.add(std::move(p0));
+            parameter::data p1("Feedback", { 0.0,    0.99,   0.001 }); registerCallback<1>(p1); p1.setDefaultValue(0.5);   data.add(std::move(p1));
+            parameter::data p2("Wet Gain", { 0.0,    4.0,    0.001 }); registerCallback<2>(p2); p2.setDefaultValue(1.0);   data.add(std::move(p2));
+            parameter::data p3("Brightness", { 0.0,    1.0,    0.001 }); registerCallback<3>(p3); p3.setDefaultValue(0.4);   data.add(std::move(p3));
+            parameter::data p4("Stereo Width", { -1.0,   1.0,    0.001 }); registerCallback<4>(p4); p4.setDefaultValue(0.0);   data.add(std::move(p4));
+            parameter::data p5("Glide (ms)", { 0.0,    5000.0, 0.1 }); registerCallback<5>(p5); p5.setDefaultValue(0.0);   data.add(std::move(p5));
         }
 
         SN_EMPTY_PROCESS_FRAME;
